@@ -40,6 +40,12 @@
     position:fixed;inset:0;pointer-events:none;
     background:radial-gradient(circle at 50% 45%, transparent 45%, rgba(4,3,8,.75) 100%);
   }
+  /* Aviso de perigo na borda da tela (obstáculo na face que vem a seguir) */
+  .edge-hint{
+    position:fixed;inset:0;z-index:2;pointer-events:none;opacity:0;
+    transition:opacity .16s linear;
+  }
+  .edge-hint.on{opacity:1}
   .hud{
     position:fixed;left:50%;transform:translateX(-50%);
     display:flex;align-items:center;gap:10px;
@@ -48,6 +54,7 @@
     border:3px solid var(--line);
     box-shadow:5px 5px 0 var(--shadow);
     backdrop-filter:blur(2px);
+    z-index:4;
   }
   .hud-top{top:12px;width:min(94vw,560px);display:grid;grid-template-columns:1fr auto 1fr;gap:8px}
   .stat{display:flex;flex-direction:column;line-height:1.1;min-width:0}
@@ -140,6 +147,7 @@
 <body>
 <div id="scene" aria-hidden="true"></div>
 <div class="vignette"></div>
+<div class="edge-hint" id="edgeHint" aria-hidden="true"></div>
 
 <header class="hud hud-top">
   <div class="stat">
@@ -203,23 +211,37 @@
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js';
 
 /* ============================================================
-   COBRINHA CÚBICA — v2 (cubo 9x9 por face, modo infinito)
+   COBRINHA CÚBICA — v2 (cubo 12x12 por face, modo infinito)
    ============================================================ */
 
 /* ---------- CONFIG ---------- */
-const N = 9;                 // células por face
-const HALF = N / 2;          // 4.5
+const N = 12;                // células por face
+const HALF = N / 2;          // 6
 const CELL = 16;             // pixels por célula nas texturas
-const TEX = N * CELL;        // 144
+const TEX = N * CELL;        // 192
+/* Velocidade geral: ticks ~6,5% mais lentos (pedido: -5% a -8%).
+   O fator entra no fim, então turbo/lama/relógio também ficam
+   proporcionalmente mais lentos. */
+const SPEED_FACTOR = 1.065;
 const TICK_START = 210;
 const TICK_MIN = 95;
 const TICK_STEP = 2;
+const TICK_MAX = 520;
+const TICK_FLOOR = 70;
 const POWERUP_LIFE = 10000;
 const EFFECT_TIME = 6000;
 const SWAP_WARNING = 1500;
 const HAZARD_WARNING = 1800;
 const HAZARD_LIFE = 4200;
-const FOG_RADIUS = 3;
+const HAZARD_SIZE = 4;       // lado da zona de perigo (células)
+const FOG_RADIUS = 4;
+/* Alerta de borda: faixa da face vizinha inspecionada na travessia */
+const EDGE_BAND = 2;         // profundidade (células) a partir da aresta
+const EDGE_SPAN = 2;         // alcance lateral ao longo da aresta
+/* Posição inicial da cobra (evita obstáculos em cima do spawn) */
+const START_FACE = 0;
+const START_X = 5;
+const START_Y = 5;
 
 /* Faces do cubo: normal n, eixos locais u (direita) e v (cima) */
 const FACES = [
@@ -293,6 +315,7 @@ const effectValue = $('effectValue');
 const swapValue = $('swapValue');
 const chipSlow = $('chipSlow');
 const chipShield = $('chipShield');
+const edgeHintEl = $('edgeHint');
 const slowBar = chipSlow.querySelector('.bar span');
 const shieldBar = chipShield.querySelector('.bar span');
 const muteBtn = $('muteBtn');
@@ -387,6 +410,17 @@ let pendingSwap = false;
 let nextPowerupAt = 3;
 let shakeUntil = 0;
 let flashUntil = 0;
+/* Estado do aviso de borda (ver seção "ALERTA DE BORDA") */
+const edgeHint = {
+  level: 0,        // 0 = nada, 1 = perigo perto, 2 = entrada bloqueada
+  side: 'right',   // aresta de saída na face atual
+  exitX: 0, exitY: 0,
+  nf: -1,          // face de destino
+  ex: 0, ey: 0,    // célula de entrada na face de destino
+  du: 1, dv: 0,    // direção de avanço dentro da face de destino
+  dist: 0,         // células que faltam até a aresta
+  cells: []        // células perigosas na face de destino
+};
 
 /* ---------- UTIL ---------- */
 function pad(value) { return String(Math.max(0, Math.floor(value))).padStart(6, '0'); }
@@ -453,9 +487,13 @@ function cellWorld(f, x, y, out) {
 
 function localOf(f, point) {
   const fv = faceVecs[f];
+  /* O deslocamento entra DENTRO do arredondamento: com N par os centros das
+     células caem em meio-célula (ex.: -5,5) e arredondar antes daria índices
+     fracionários. */
+  const off = (N - 1) / 2;
   return {
-    x: Math.round(point.dot(fv.u)) + (N - 1) / 2,
-    y: Math.round(point.dot(fv.v)) + (N - 1) / 2
+    x: Math.round(point.dot(fv.u) + off),
+    y: Math.round(point.dot(fv.v) + off)
   };
 }
 
@@ -586,7 +624,8 @@ function isBlockAt(f, x, y) {
 
 function isHazardAt(f, x, y) {
   if (!hazard || hazard.state !== 'live') return false;
-  return f === hazard.f && x >= hazard.x && x < hazard.x + 3 && y >= hazard.y && y < hazard.y + 3;
+  return f === hazard.f && x >= hazard.x && x < hazard.x + HAZARD_SIZE &&
+         y >= hazard.y && y < hazard.y + HAZARD_SIZE;
 }
 
 function isOnSnake(f, x, y) {
@@ -614,8 +653,8 @@ function randomFreeCell() {
   if (apple) occupied.add(cellKey(apple.f, apple.x, apple.y));
   if (powerup) occupied.add(cellKey(powerup.f, powerup.x, powerup.y));
   if (hazard) {
-    for (let y = hazard.y; y < hazard.y + 3; y++) {
-      for (let x = hazard.x; x < hazard.x + 3; x++) occupied.add(cellKey(hazard.f, x, y));
+    for (let y = hazard.y; y < hazard.y + HAZARD_SIZE; y++) {
+      for (let x = hazard.x; x < hazard.x + HAZARD_SIZE; x++) occupied.add(cellKey(hazard.f, x, y));
     }
   }
   const free = [];
@@ -644,7 +683,7 @@ function maybeSpawnPowerup() {
     type: pick(['star', 'clock', 'shield']),
     expiresAt: gameTime + POWERUP_LIFE
   };
-  nextPowerupAt = applesTotal + randInt(3, 5);
+  nextPowerupAt = applesTotal + randInt(2, 4);
 }
 
 function assignEffects(initial) {
@@ -687,18 +726,21 @@ function generateObstacles() {
     used.add(cellKey(c.f, c.x, c.y));
   }
   for (let f = 0; f < FACE_COUNT; f++) {
-    const count = 4 + randInt(0, 2);
+    /* Face 12x12: mais obstáculos por face (antes 4–6 em 9x9). */
+    const count = 9 + randInt(0, 3);
     let made = 0;
     let guard = 0;
-    while (made < count && guard < 240) {
+    while (made < count && guard < 500) {
       guard++;
       const x = randInt(0, N - 1);
       const y = randInt(0, N - 1);
       const key = cellKey(f, x, y);
       if (used.has(key)) continue;
-      if (f === 0 && y === 4) continue;
-      if (f === 0 && x <= 5 && Math.abs(y - 4) <= 1) continue;
-      if (f === 2 && x === 0 && Math.abs(y - 4) <= 1) continue;
+      /* runway inicial: a cobra nasce em START_X/START_Y e sai andando para +u */
+      if (f === START_FACE && y === START_Y) continue;
+      if (f === START_FACE && x <= START_X + 1 && Math.abs(y - START_Y) <= 1) continue;
+      /* entrada da face vizinha por onde a cobra passa logo no começo */
+      if (f === 2 && x === 0 && Math.abs(y - START_Y) <= 1) continue;
       let close = false;
       for (let i = 0; i < list.length; i++) {
         const o = list[i];
@@ -750,7 +792,7 @@ function startGame() {
   state = 'playing';
   hideOverlay();
   updateHUD();
-  showBanner('CUBO 9×9', '6 FACES · MODO INFINITO', 1600);
+  showBanner('CUBO 12×12', '6 FACES · MODO INFINITO', 1600);
   syncCube(true);
 }
 
@@ -782,7 +824,8 @@ function currentTick() {
   let interval = Math.max(TICK_MIN, tickBase);
   if (eff.tick) interval *= eff.tick;
   if (gameTime < effect.slowUntil) interval *= 1.6;
-  return Math.min(520, Math.max(70, interval));
+  /* Velocidade geral reduzida (SPEED_FACTOR > 1 = mais devagar). */
+  return Math.min(TICK_MAX, Math.max(TICK_FLOOR, interval)) * SPEED_FACTOR;
 }
 
 function step() {
@@ -888,6 +931,13 @@ for (let f = 0; f < FACE_COUNT; f++) {
   faceCanvases.push({ canvas, context });
   faceTextures.push(texture);
 }
+
+/* Fundo xadrez + grade: igual em todas as faces, então é desenhado UMA vez
+   e copiado (evita repintar 144 células × 6 faces a cada quadro). */
+const baseCanvas = document.createElement('canvas');
+baseCanvas.width = TEX;
+baseCanvas.height = TEX;
+drawBase(baseCanvas.getContext('2d'));
 
 function drawSprite(ctx, matrix, ox, oy, palette, override) {
   for (let y = 0; y < matrix.length; y++) {
@@ -1012,8 +1062,8 @@ function drawHazardZone(ctx, hz) {
   const live = hz.state === 'live';
   const blink = Math.floor(animTime / 150) % 2 === 0;
   if (!live && !blink) return;
-  for (let y = hz.y; y < hz.y + 3; y++) {
-    for (let x = hz.x; x < hz.x + 3; x++) {
+  for (let y = hz.y; y < hz.y + HAZARD_SIZE; y++) {
+    for (let x = hz.x; x < hz.x + HAZARD_SIZE; x++) {
       const px = x * CELL;
       const py = (N - 1 - y) * CELL;
       if (live) {
@@ -1037,7 +1087,75 @@ function drawHazardZone(ctx, hz) {
   }
   ctx.strokeStyle = live ? '#ff4d5e' : '#ffd447';
   ctx.lineWidth = 3;
-  ctx.strokeRect(hz.x * CELL + 1.5, (N - 1 - (hz.y + 2)) * CELL + 1.5, 3 * CELL - 3, 3 * CELL - 3);
+  ctx.strokeRect(hz.x * CELL + 1.5,
+    (N - 1 - (hz.y + HAZARD_SIZE - 1)) * CELL + 1.5,
+    HAZARD_SIZE * CELL - 3, HAZARD_SIZE * CELL - 3);
+}
+
+/* Seta apontando para fora da aresta ("cuidado aqui"). */
+function drawArrowTip(ctx, side, px, py, size, color) {
+  ctx.fillStyle = color;
+  for (let i = 0; i < size; i++) {
+    const w = size - i;
+    if (side === 'right') ctx.fillRect(px + i, py - w, 1, w * 2);
+    else if (side === 'left') ctx.fillRect(px - i, py - w, 1, w * 2);
+    else if (side === 'top') ctx.fillRect(px - w, py - i, w * 2, 1);
+    else ctx.fillRect(px - w, py + i, w * 2, 1);
+  }
+}
+
+/* Marca na aresta de saída da face atual: mostra por onde a cobra vai sair
+   e que existe perigo logo do outro lado. */
+function drawEdgeMarker(ctx, h) {
+  if (h.level <= 0) return;
+  const strong = h.level >= 2;
+  const pulse = reduceMotion ? 0.85 : (0.55 + 0.45 * Math.sin(animTime / 170));
+  const fade = h.dist <= 1 ? 1 : h.dist <= 3 ? 0.85 : 0.6;
+  const rgb = strong ? '255,77,94' : '255,196,71';
+  const band = Math.max(4, Math.round(CELL * 0.34));
+  const px = h.exitX * CELL;
+  const py = (N - 1 - h.exitY) * CELL;
+
+  /* fio tênue ao longo de toda a aresta de saída */
+  ctx.fillStyle = 'rgba(' + rgb + ',' + (0.09 * fade).toFixed(3) + ')';
+  if (h.side === 'left') ctx.fillRect(0, 0, band, TEX);
+  else if (h.side === 'right') ctx.fillRect(TEX - band, 0, band, TEX);
+  else if (h.side === 'bottom') ctx.fillRect(0, TEX - band, TEX, band);
+  else ctx.fillRect(0, 0, TEX, band);
+
+  /* marca concentrada na célula por onde a cobra vai sair */
+  ctx.fillStyle = 'rgba(' + rgb + ',' + (0.32 * pulse * fade).toFixed(3) + ')';
+  if (h.side === 'left' || h.side === 'right') {
+    const x = h.side === 'left' ? 0 : TEX - band;
+    ctx.fillRect(x, py - CELL, band, CELL * 3);
+  } else {
+    const y = h.side === 'bottom' ? TEX - band : 0;
+    ctx.fillRect(px - CELL, y, CELL * 3, band);
+  }
+
+  /* seta apontando para fora da aresta */
+  const tip = 'rgba(' + rgb + ',' + Math.min(1, 0.9 * pulse * fade).toFixed(3) + ')';
+  const size = 6;
+  if (h.side === 'right') drawArrowTip(ctx, 'right', TEX - size, py + (CELL >> 1), size, tip);
+  else if (h.side === 'left') drawArrowTip(ctx, 'left', size - 1, py + (CELL >> 1), size, tip);
+  else if (h.side === 'top') drawArrowTip(ctx, 'top', px + (CELL >> 1), size - 1, size, tip);
+  else drawArrowTip(ctx, 'bottom', px + (CELL >> 1), TEX - size, size, tip);
+}
+
+/* "!" nas células perigosas da face vizinha (a que vem a seguir). */
+function drawEdgeMarks(ctx, h) {
+  if (h.level <= 0 || !h.cells.length) return;
+  const pulse = reduceMotion ? 0.85 : (0.5 + 0.5 * Math.sin(animTime / 200));
+  for (let i = 0; i < h.cells.length; i++) {
+    const c = h.cells[i];
+    const px = c.x * CELL;
+    const py = (N - 1 - c.y) * CELL;
+    const rgb = c.entry ? '255,77,94' : '255,196,71';
+    const a = (c.entry ? 0.95 : 0.5) * pulse;
+    ctx.fillStyle = 'rgba(' + rgb + ',' + a.toFixed(3) + ')';
+    ctx.fillRect(px + 7, py + 3, 2, 7);
+    ctx.fillRect(px + 7, py + 12, 2, 2);
+  }
 }
 
 function drawSnakeCell(ctx, x, y, index, isHead, isTail) {
@@ -1179,7 +1297,7 @@ function drawParticles(ctx, f) {
 
 function drawFace(f) {
   const ctx = faceCanvases[f].context;
-  drawBase(ctx);
+  ctx.drawImage(baseCanvas, 0, 0);
   drawEffectTint(ctx, faceEffects[f]);
 
   for (let i = 0; i < obstacles.length; i++) {
@@ -1204,6 +1322,13 @@ function drawFace(f) {
     }
   }
   if (hazard && hazard.f === f) drawHazardZone(ctx, hazard);
+
+  /* aviso de borda: perigo marcado na face vizinha (por cima do obstáculo)
+     e marca na aresta de saída da face em que a cobra está */
+  if (edgeHint.level > 0) {
+    if (edgeHint.nf === f) drawEdgeMarks(ctx, edgeHint);
+    if (snake && snake.cells[0].f === f) drawEdgeMarker(ctx, edgeHint);
+  }
   if (apple && apple.f === f) drawAppleSprite(ctx, apple.x, apple.y, EFFECTS[faceEffects[f]].dourada);
   if (powerup && powerup.f === f) drawPowerupSprite(ctx, powerup);
 
@@ -1243,14 +1368,15 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color('#0b0912');
 
 const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 300);
-const CAM_DIR = new THREE.Vector3(13.5, 10.5, 15.5).normalize();
-const CAM_DIST_BASE = Math.hypot(13.5, 10.5, 15.5);
+const CAM_DIR = new THREE.Vector3(18, 14, 20.7).normalize();
+const CAM_DIST_BASE = Math.hypot(18, 14, 20.7);
 let camDist = CAM_DIST_BASE;
 
 function computeCamDist() {
   const aspect = window.innerWidth / window.innerHeight;
   const halfFov = THREE.MathUtils.degToRad(camera.fov) / 2;
-  const need = 13.6 / (2 * Math.tan(halfFov) * Math.min(1, aspect));
+  /* 1.511 ≈ 13.6/9: meia diagonal do cubo + folga, agora em função de N. */
+  const need = (N * 1.511) / (2 * Math.tan(halfFov) * Math.min(1, aspect));
   return Math.min(CAM_DIST_BASE * 1.6, Math.max(CAM_DIST_BASE, need));
 }
 
@@ -1395,14 +1521,14 @@ function updateCube(dt) {
 
   camera.position.copy(CAM_DIR).multiplyScalar(camDist);
   if (!reduceMotion) {
-    camera.position.x += Math.sin(animTime * 0.0007) * 0.15;
-    camera.position.y += Math.sin(animTime * 0.0009 + 1.7) * 0.12;
-    camera.position.z += Math.cos(animTime * 0.0006 + 0.5) * 0.15;
+    camera.position.x += Math.sin(animTime * 0.0007) * 0.2;
+    camera.position.y += Math.sin(animTime * 0.0009 + 1.7) * 0.16;
+    camera.position.z += Math.cos(animTime * 0.0006 + 0.5) * 0.2;
   }
   if (animTime < shakeUntil) {
     const k = (shakeUntil - animTime) / 300;
-    camera.position.x += (Math.random() - 0.5) * 3 * k;
-    camera.position.y += (Math.random() - 0.5) * 3 * k;
+    camera.position.x += (Math.random() - 0.5) * 4 * k;
+    camera.position.y += (Math.random() - 0.5) * 4 * k;
   }
   camera.lookAt(0, 0, 0);
 
@@ -1415,17 +1541,159 @@ function updateCube(dt) {
     .addScaledVector(camUp, -0.105 * camDist * tanH);
 }
 
+/* ---------- ALERTA DE BORDA ----------
+   Ao virar de face a cobra entra na face vizinha e pode morrer em cima de um
+   obstáculo que ela nunca teve chance de ver. Aqui a travessia é antecipada:
+   calcula-se a face de destino, a célula exata de entrada e a faixa de
+   células perigosas logo depois da aresta. O aviso aparece em três lugares:
+     1. marca na aresta de saída da face atual (seta apontando para fora);
+     2. "!" nas células perigosas da face vizinha;
+     3. brilho tênue na borda da tela para onde a cobra está indo.
+   O estado (edgeHint) fica na seção de estado do jogo. */
+const hintDir = new THREE.Vector3();
+
+function computeEdgeHint() {
+  const h = edgeHint;
+  h.level = 0;
+  h.cells.length = 0;
+  h.nf = -1;
+  if (!snake || state !== 'playing') return h;
+  const head = snake.cells[0];
+  const f = head.f;
+  const fv = faceVecs[f];
+
+  /* direção do próximo passo (com a primeira volta da fila já aplicada) */
+  hintDir.copy(snake.dir);
+  if (turns.length) {
+    if (turns[0] < 0) inStep.crossVectors(fv.n, hintDir);
+    else inStep.crossVectors(hintDir, fv.n);
+    hintDir.copy(inStep).round();
+  }
+  const da = Math.round(hintDir.dot(fv.u));
+  const db = Math.round(hintDir.dot(fv.v));
+  if (!da && !db) return h;
+
+  /* aresta de saída na face atual */
+  let exitX = head.x, exitY = head.y, nextNormal;
+  if (da < 0) {
+    nextNormal = fv.u.clone().negate();
+    exitX = 0; h.side = 'left'; h.dist = head.x;
+  } else if (da > 0) {
+    nextNormal = fv.u.clone();
+    exitX = N - 1; h.side = 'right'; h.dist = N - 1 - head.x;
+  } else if (db < 0) {
+    nextNormal = fv.v.clone().negate();
+    exitY = 0; h.side = 'bottom'; h.dist = head.y;
+  } else {
+    nextNormal = fv.v.clone();
+    exitY = N - 1; h.side = 'top'; h.dist = N - 1 - head.y;
+  }
+  h.exitX = exitX;
+  h.exitY = exitY;
+
+  /* face de destino e célula exata de entrada (mesma matemática do
+     crossEdge, porém com a célula de saída projetada) */
+  const nf = faceIndexFromNormal(nextNormal);
+  h.nf = nf;
+  const tv = faceVecs[nf];
+  const point = cellWorld(f, exitX, exitY, new THREE.Vector3());
+  point.addScaledVector(nextNormal, 0.5).addScaledVector(fv.n, -0.5);
+  const local = localOf(nf, point);
+  const ex = local.x, ey = local.y;
+  h.ex = ex;
+  h.ey = ey;
+
+  const newDir = fv.n.clone().negate();
+  const du = Math.round(newDir.dot(tv.u));
+  const dv = Math.round(newDir.dot(tv.v));
+  h.du = du;
+  h.dv = dv;
+
+  /* profundidade a partir da aresta de entrada + distância lateral */
+  const depthOf = (x, y) => {
+    if (dv === 0) return du > 0 ? x : (N - 1 - x);
+    return dv > 0 ? y : (N - 1 - y);
+  };
+  const lateralOf = (x, y) => (dv === 0 ? Math.abs(y - ey) : Math.abs(x - ex));
+
+  let level = 0;
+  const mark = (x, y) => {
+    if (x < 0 || x >= N || y < 0 || y >= N) return;
+    const depth = depthOf(x, y);
+    if (depth >= EDGE_BAND) return;
+    const lateral = lateralOf(x, y);
+    if (lateral > EDGE_SPAN) return;
+    const entry = (x === ex && y === ey);
+    /* a cobra entra e segue reto: essas duas células matam na hora */
+    const straight = lateral === 0 && depth <= 1;
+    h.cells.push({ x, y, entry: entry || straight });
+    if (entry || straight) level = 2;
+    else if (level < 1) level = 1;
+  };
+
+  for (let i = 0; i < obstacles.length; i++) {
+    const o = obstacles[i];
+    if (o.f === nf) mark(o.x, o.y);
+  }
+  for (let i = 0; i < tempBlocks.length; i++) {
+    const b = tempBlocks[i];
+    if (b.f === nf) mark(b.x, b.y);
+  }
+  if (hazard && hazard.f === nf) {
+    for (let y = hazard.y; y < hazard.y + HAZARD_SIZE; y++) {
+      for (let x = hazard.x; x < hazard.x + HAZARD_SIZE; x++) mark(x, y);
+    }
+  }
+  h.level = level;
+  return h;
+}
+
+/* Brilho na borda da tela: indica o lado para onde a cobra está indo e onde
+   existe perigo na face seguinte. */
+function updateEdgeHintScreen(h) {
+  if (!h.level || !snake) {
+    edgeHintEl.classList.remove('on');
+    return;
+  }
+  const f = snake.cells[0].f;
+  const fv = faceVecs[f];
+  presentedFrame(f, presU, presV);
+  let dir;
+  if (h.side === 'right') dir = fv.u;
+  else if (h.side === 'left') dir = fv.u.clone().negate();
+  else if (h.side === 'top') dir = fv.v;
+  else dir = fv.v.clone().negate();
+  const su = dir.dot(presU);
+  const sv = dir.dot(presV);
+  let side;
+  if (Math.abs(su) >= Math.abs(sv)) side = su > 0 ? 'right' : 'left';
+  else side = sv > 0 ? 'top' : 'bottom';
+
+  const strong = h.level >= 2;
+  const rgb = strong ? '255,77,94' : '255,196,71';
+  const a = strong ? 0.26 : 0.14;
+  let gradient;
+  if (side === 'right') gradient = 'linear-gradient(to right, rgba(' + rgb + ',' + a + '), rgba(' + rgb + ',0) 18%)';
+  else if (side === 'left') gradient = 'linear-gradient(to left, rgba(' + rgb + ',' + a + '), rgba(' + rgb + ',0) 18%)';
+  else if (side === 'top') gradient = 'linear-gradient(to top, rgba(' + rgb + ',' + a + '), rgba(' + rgb + ',0) 16%)';
+  else gradient = 'linear-gradient(to bottom, rgba(' + rgb + ',' + a + '), rgba(' + rgb + ',0) 16%)';
+  edgeHintEl.style.background = gradient;
+  edgeHintEl.classList.add('on');
+}
+
 /* ---------- ROTINAS DE PERIGO E CAOS ---------- */
 let instavelTimer = 0;
 
 function spawnHazard() {
   for (let attempt = 0; attempt < 12; attempt++) {
     const f = randInt(0, FACE_COUNT - 1);
-    const hx = randInt(0, N - 3);
-    const hy = randInt(0, N - 3);
+    const hx = randInt(0, N - HAZARD_SIZE);
+    const hy = randInt(0, N - HAZARD_SIZE);
     const head = snake.cells[0];
-    const coversHead = head.f === f && head.x >= hx && head.x < hx + 3 && head.y >= hy && head.y < hy + 3;
-    const coversApple = apple && apple.f === f && apple.x >= hx && apple.x < hx + 3 && apple.y >= hy && apple.y < hy + 3;
+    const coversHead = head.f === f && head.x >= hx && head.x < hx + HAZARD_SIZE &&
+                       head.y >= hy && head.y < hy + HAZARD_SIZE;
+    const coversApple = apple && apple.f === f && apple.x >= hx && apple.x < hx + HAZARD_SIZE &&
+                        apple.y >= hy && apple.y < hy + HAZARD_SIZE;
     if (coversHead || coversApple) continue;
     hazard = { f, x: hx, y: hy, state: 'warn', until: gameTime + HAZARD_WARNING };
     audio.danger();
@@ -1438,7 +1706,7 @@ function spawnHazard() {
 function updateInstavel(dt) {
   instavelTimer -= dt * 1000;
   if (instavelTimer > 0) return;
-  instavelTimer = 4000 + Math.random() * 3000;
+  instavelTimer = 3000 + Math.random() * 2500;
 
   const unstableFaces = [];
   for (let f = 0; f < FACE_COUNT; f++) {
@@ -1448,16 +1716,26 @@ function updateInstavel(dt) {
 
   const f = pick(unstableFaces);
   const head = snake.cells[0];
-  for (let attempt = 0; attempt < 24; attempt++) {
-    const x = randInt(0, N - 1);
-    const y = randInt(0, N - 1);
-    if (isOnSnake(f, x, y) || isBlockAt(f, x, y)) continue;
-    if (apple && apple.f === f && apple.x === x && apple.y === y) continue;
-    if (powerup && powerup.f === f && powerup.x === x && powerup.y === y) continue;
-    if (isHazardAt(f, x, y)) continue;
-    if (head.f === f && Math.max(Math.abs(head.x - x), Math.abs(head.y - y)) < 2) continue;
-    tempBlocks.push({ f, x, y, warnUntil: animTime + 1100, until: animTime + 9000 });
-    return;
+  /* às vezes mais de um bloco de uma vez */
+  const amount = Math.random() < 0.45 ? 2 : 1;
+  for (let n = 0; n < amount; n++) {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const x = randInt(0, N - 1);
+      const y = randInt(0, N - 1);
+      if (isOnSnake(f, x, y) || isBlockAt(f, x, y)) continue;
+      if (apple && apple.f === f && apple.x === x && apple.y === y) continue;
+      if (powerup && powerup.f === f && powerup.x === x && powerup.y === y) continue;
+      if (isHazardAt(f, x, y)) continue;
+      if (head.f === f && Math.max(Math.abs(head.x - x), Math.abs(head.y - y)) < 2) continue;
+      let dup = false;
+      for (let i = 0; i < tempBlocks.length; i++) {
+        const b = tempBlocks[i];
+        if (b.f === f && b.x === x && b.y === y) { dup = true; break; }
+      }
+      if (dup) continue;
+      tempBlocks.push({ f, x, y, warnUntil: animTime + 1100, until: animTime + 9000 });
+      break;
+    }
   }
 }
 
@@ -1507,7 +1785,7 @@ function frame(now) {
         hazard.until = gameTime + HAZARD_LIFE;
       } else {
         hazard = null;
-        nextHazardAt = gameTime + Math.max(8000, 15000 - applesTotal * 150);
+        nextHazardAt = gameTime + Math.max(6000, 12000 - applesTotal * 120);
       }
     }
 
@@ -1522,6 +1800,8 @@ function frame(now) {
   }
 
   updateEffectBars();
+  computeEdgeHint();
+  updateEdgeHintScreen(edgeHint);
   updateCube(dt);
   drawAllFaces();
   renderer.render(scene, camera);
@@ -1542,10 +1822,11 @@ function overlayMarkup(kind) {
     return '' +
       '<div class="panel">' +
         '<h1 class="logo"><span class="logo-main">COBRINHA CÚBICA</span><span class="logo-sub">V2 · CUBO</span></h1>' +
-        '<p class="tagline">CUBO 9×9 · 6 FACES · MODO INFINITO<br>EFEITOS QUE VIRAM A CADA 2–4 MAÇÃS</p>' +
+        '<p class="tagline">CUBO 12×12 · 6 FACES · MODO INFINITO<br>EFEITOS QUE VIRAM A CADA 2–4 MAÇÃS</p>' +
         '<p class="hint">A COBRA DOBRA NAS ARESTAS E ATRAVESSA AS FACES.<br>' +
         '<b>← ↑ ↓ →</b> / <b>WASD</b> MOVEM NA DIREÇÃO DA TELA<br>' +
-        '<b>DESLIZE</b> A TELA PARA MUDAR DE DIREÇÃO · <b>P</b> PAUSA · <b>M</b> SOM</p>' +
+        '<b>DESLIZE</b> A TELA PARA MUDAR DE DIREÇÃO · <b>P</b> PAUSA · <b>M</b> SOM<br>' +
+        '<b>MARCA NA BORDA</b> E BRILHO NA TELA AVISAM DE OBSTÁCULO NA FACE SEGUINTE</p>' +
         '<p class="best">RECORDE<b>' + pad(highScore) + '</b></p>' +
         '<button class="btn" data-action="start" type="button">JOGAR</button>' +
       '</div>';
@@ -1704,8 +1985,10 @@ function initWorld() {
   instavelTimer = 0;
   snake = {
     cells: [
-      { f: 0, x: 4, y: 4 }, { f: 0, x: 3, y: 4 },
-      { f: 0, x: 2, y: 4 }, { f: 0, x: 1, y: 4 }
+      { f: START_FACE, x: START_X, y: START_Y },
+      { f: START_FACE, x: START_X - 1, y: START_Y },
+      { f: START_FACE, x: START_X - 2, y: START_Y },
+      { f: START_FACE, x: START_X - 3, y: START_Y }
     ],
     dir: new THREE.Vector3(1, 0, 0)
   };
@@ -1713,7 +1996,7 @@ function initWorld() {
   faceSpin.fill(0);
   apple = null;
   powerup = null;
-  nextPowerupAt = randInt(3, 5);
+  nextPowerupAt = randInt(2, 4);
   assignEffects(true);
   swapsSince = 0;
   nextSwapAt = randInt(2, 4);
